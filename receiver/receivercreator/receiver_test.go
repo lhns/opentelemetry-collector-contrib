@@ -97,7 +97,7 @@ func TestMockedEndToEnd(t *testing.T) {
 
 	// Test that we can send metrics.
 	for _, receiver := range dyn.observerHandler.receiversByEndpointID.Values() {
-		wr := receiver.(*wrappedReceiver)
+		wr := receiver.component.(*wrappedReceiver)
 		example := wr.metrics.(*nopWithEndpointReceiver)
 		md := pmetric.NewMetrics()
 		rm := md.ResourceMetrics().AppendEmpty()

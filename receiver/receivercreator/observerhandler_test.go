@@ -683,7 +683,7 @@ func TestOnRemoveForProfiles(t *testing.T) {
 	require.NoError(t, r.lastError)
 }
 
-func TestOnChange(t *testing.T) {
+func TestOnChangeNoRestart(t *testing.T) {
 	cfg := createDefaultConfig().(*Config)
 	rcvrCfg := receiverConfig{
 		id:         component.MustNewIDWithName("with_endpoint", "some.name"),
@@ -706,7 +706,48 @@ func TestOnChange(t *testing.T) {
 	require.NotNil(t, origRcvr)
 	require.NoError(t, r.lastError)
 
+	// Reset counters after OnAdd
+	r.startCount = 0
+	r.shutdownCount = 0
+
+	// OnChange with the same endpoint should NOT restart the receiver
 	handler.OnChange([]observer.Endpoint{portEndpoint})
+
+	require.NoError(t, r.lastError)
+	assert.Equal(t, 0, r.shutdownCount, "receiver should not have been shut down")
+	assert.Equal(t, 0, r.startCount, "receiver should not have been started")
+	assert.Equal(t, 1, handler.receiversByEndpointID.Size())
+	assert.Same(t, origRcvr, handler.receiversByEndpointID.Get("port-1")[0].component)
+}
+
+func TestOnChangeWithTargetChange(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	rcvrCfg := receiverConfig{
+		id:         component.MustNewIDWithName("with_endpoint", "some.name"),
+		config:     userConfigMap{"endpoint": "some.endpoint"},
+		endpointID: portEndpoint.ID,
+	}
+	cfg.receiverTemplates = map[string]receiverTemplate{
+		rcvrCfg.id.String(): {
+			receiverConfig:     rcvrCfg,
+			rule:               portRule,
+			Rule:               `type == "port"`,
+			ResourceAttributes: map[string]any{},
+			signals:            receiverSignals{metrics: true, logs: true, traces: true, profiles: true},
+		},
+	}
+	handler, r := newObserverHandler(t, cfg, nil, consumertest.NewNop(), nil, nil)
+	handler.OnAdd([]observer.Endpoint{portEndpoint})
+
+	origRcvr := r.startedComponent
+	require.NotNil(t, origRcvr)
+	require.NoError(t, r.lastError)
+
+	// Change the endpoint target
+	changedEndpoint := portEndpoint
+	changedEndpoint.Target = "localhost:5678"
+
+	handler.OnChange([]observer.Endpoint{changedEndpoint})
 
 	require.NoError(t, r.lastError)
 	assert.Same(t, origRcvr, r.shutdownComponent)
@@ -716,7 +757,68 @@ func TestOnChange(t *testing.T) {
 	require.NotNil(t, newRcvr)
 
 	assert.Equal(t, 1, handler.receiversByEndpointID.Size())
-	assert.Same(t, newRcvr, handler.receiversByEndpointID.Get("port-1")[0])
+	assert.Same(t, newRcvr, handler.receiversByEndpointID.Get("port-1")[0].component)
+}
+
+func TestOnChangeWithConfigChange(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	// Use a backtick expression that references a pod label
+	rcvrCfg := receiverConfig{
+		id:         component.MustNewIDWithName("with_endpoint", "some.name"),
+		config:     userConfigMap{"endpoint": "`pod.labels[\"app\"]` + \":8080\""},
+		endpointID: portEndpoint.ID,
+	}
+	cfg.receiverTemplates = map[string]receiverTemplate{
+		rcvrCfg.id.String(): {
+			receiverConfig:     rcvrCfg,
+			rule:               portRule,
+			Rule:               `type == "port"`,
+			ResourceAttributes: map[string]any{},
+			signals:            receiverSignals{metrics: true, logs: true, traces: true, profiles: true},
+		},
+	}
+	handler, r := newObserverHandler(t, cfg, nil, consumertest.NewNop(), nil, nil)
+	handler.OnAdd([]observer.Endpoint{portEndpoint})
+
+	origRcvr := r.startedComponent
+	require.NotNil(t, origRcvr)
+	require.NoError(t, r.lastError)
+
+	// Change a pod label that is referenced in the config expression
+	changedEndpoint := observer.Endpoint{
+		ID:     "port-1",
+		Target: "localhost:1234",
+		Details: &observer.Port{
+			Name: "http",
+			Pod: observer.Pod{
+				UID:       "uid-1",
+				Namespace: "default",
+				Name:      "pod-1",
+				Labels: map[string]string{
+					"app":    "nginx", // changed from "redis" to "nginx"
+					"region": "west-1",
+				},
+				Annotations: map[string]string{
+					"scrape": "true",
+				},
+			},
+			Port:           1234,
+			Transport:      observer.ProtocolTCP,
+			ContainerName:  "container-1",
+			ContainerID:    "container-id-1",
+			ContainerImage: "redis:latest",
+		},
+	}
+
+	handler.OnChange([]observer.Endpoint{changedEndpoint})
+
+	require.NoError(t, r.lastError)
+	assert.Same(t, origRcvr, r.shutdownComponent, "original receiver should have been shut down")
+
+	newRcvr := r.startedComponent
+	require.NotSame(t, origRcvr, newRcvr, "a new receiver should have been started")
+	require.NotNil(t, newRcvr)
+	assert.Equal(t, 1, handler.receiversByEndpointID.Size())
 }
 
 type mockRunner struct {
@@ -724,6 +826,8 @@ type mockRunner struct {
 	startedComponent  component.Component
 	shutdownComponent component.Component
 	lastError         error
+	startCount        int
+	shutdownCount     int
 }
 
 func (r *mockRunner) start(
@@ -732,12 +836,14 @@ func (r *mockRunner) start(
 	consumer *enhancingConsumer,
 ) (component.Component, error) {
 	r.startedComponent, r.lastError = r.receiverRunner.start(receiver, discoveredConfig, consumer)
+	r.startCount++
 	return r.startedComponent, r.lastError
 }
 
 func (r *mockRunner) shutdown(rcvr component.Component) error {
 	r.shutdownComponent = rcvr
 	r.lastError = r.receiverRunner.shutdown(rcvr)
+	r.shutdownCount++
 	return r.lastError
 }
 

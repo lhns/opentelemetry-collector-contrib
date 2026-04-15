@@ -7,16 +7,15 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"go.opentelemetry.io/collector/component"
 )
 
 func TestReceiverMap(t *testing.T) {
 	rm := receiverMap{}
 	assert.Equal(t, 0, rm.Size())
 
-	r1 := &nopWithEndpointReceiver{}
-	r2 := &nopWithEndpointReceiver{}
-	r3 := &nopWithEndpointReceiver{}
+	r1 := resolvedReceiver{component: &nopWithEndpointReceiver{}, templateKey: "t1"}
+	r2 := resolvedReceiver{component: &nopWithEndpointReceiver{}, templateKey: "t2"}
+	r3 := resolvedReceiver{component: &nopWithEndpointReceiver{}, templateKey: "t3"}
 
 	rm.Put("a", r1)
 	assert.Equal(t, 1, rm.Size())
@@ -27,7 +26,7 @@ func TestReceiverMap(t *testing.T) {
 	rm.Put("b", r3)
 	assert.Equal(t, 3, rm.Size())
 
-	assert.Equal(t, []component.Component{r1, r2}, rm.Get("a"))
+	assert.Equal(t, []resolvedReceiver{r1, r2}, rm.Get("a"))
 	assert.Nil(t, rm.Get("missing"))
 
 	rm.RemoveAll("missing")
@@ -42,5 +41,5 @@ func TestReceiverMap(t *testing.T) {
 	rm.Put("a", r1)
 	rm.Put("b", r2)
 	assert.Equal(t, 2, rm.Size())
-	assert.Equal(t, []component.Component{r1, r2}, rm.Values())
+	assert.Equal(t, []resolvedReceiver{r1, r2}, rm.Values())
 }

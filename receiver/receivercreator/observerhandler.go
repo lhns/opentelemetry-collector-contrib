@@ -5,6 +5,7 @@ package receivercreator // import "github.com/open-telemetry/opentelemetry-colle
 
 import (
 	"fmt"
+	"reflect"
 	"sync"
 
 	"go.opentelemetry.io/collector/component"
@@ -53,7 +54,7 @@ func (obs *observerHandler) shutdown() error {
 	var errs []error
 
 	for _, rcvr := range obs.receiversByEndpointID.Values() {
-		if err := obs.runner.shutdown(rcvr); err != nil {
+		if err := obs.runner.shutdown(rcvr.component); err != nil {
 			// TODO: Should keep track of which receiver the error is associated with
 			// but require some restructuring.
 			errs = append(errs, err)
@@ -75,7 +76,11 @@ func (obs *observerHandler) ID() observer.NotifyID {
 func (obs *observerHandler) OnAdd(added []observer.Endpoint) {
 	obs.Lock()
 	defer obs.Unlock()
+	obs.onAddLocked(added)
+}
 
+// onAddLocked is the internal implementation of OnAdd that must be called with the lock held.
+func (obs *observerHandler) onAddLocked(added []observer.Endpoint) {
 	for _, e := range added {
 		var env observer.EndpointEnv
 		var err error
@@ -93,19 +98,19 @@ func (obs *observerHandler) OnAdd(added []observer.Endpoint) {
 			}
 			if subreceiverTemplate != nil {
 				obs.params.Logger.Debug("adding K8s hinted receiver", zap.Any("subreceiver", subreceiverTemplate))
-				obs.startReceiver(*subreceiverTemplate, env, e)
+				obs.startReceiver(*subreceiverTemplate, env, e, "")
 				continue
 			}
 		}
 
-		for _, template := range obs.config.receiverTemplates {
+		for templateKey, template := range obs.config.receiverTemplates {
 			if matches, err := template.rule.eval(env); err != nil {
 				obs.params.Logger.Error("failed matching rule", zap.String("rule", template.Rule), zap.Error(err))
 				continue
 			} else if !matches {
 				continue
 			}
-			obs.startReceiver(template, env, e)
+			obs.startReceiver(template, env, e, templateKey)
 		}
 	}
 }
@@ -114,7 +119,11 @@ func (obs *observerHandler) OnAdd(added []observer.Endpoint) {
 func (obs *observerHandler) OnRemove(removed []observer.Endpoint) {
 	obs.Lock()
 	defer obs.Unlock()
+	obs.onRemoveLocked(removed)
+}
 
+// onRemoveLocked is the internal implementation of OnRemove that must be called with the lock held.
+func (obs *observerHandler) onRemoveLocked(removed []observer.Endpoint) {
 	for _, e := range removed {
 		// debug log the endpoint to improve usability
 		if ce := obs.params.Logger.Check(zap.DebugLevel, "handling removed endpoint"); ce != nil {
@@ -127,10 +136,10 @@ func (obs *observerHandler) OnRemove(removed []observer.Endpoint) {
 		}
 
 		for _, rcvr := range obs.receiversByEndpointID.Get(e.ID) {
-			obs.params.Logger.Info("stopping receiver", zap.Reflect("receiver", rcvr), zap.String("endpoint_id", string(e.ID)))
+			obs.params.Logger.Info("stopping receiver", zap.Reflect("receiver", rcvr.component), zap.String("endpoint_id", string(e.ID)))
 
-			if err := obs.runner.shutdown(rcvr); err != nil {
-				obs.params.Logger.Error("failed to stop receiver", zap.Reflect("receiver", rcvr), zap.Error(err))
+			if err := obs.runner.shutdown(rcvr.component); err != nil {
+				obs.params.Logger.Error("failed to stop receiver", zap.Reflect("receiver", rcvr.component), zap.Error(err))
 				continue
 			}
 		}
@@ -140,12 +149,88 @@ func (obs *observerHandler) OnRemove(removed []observer.Endpoint) {
 
 // OnChange responds to endpoint change notifications.
 func (obs *observerHandler) OnChange(changed []observer.Endpoint) {
-	// TODO: optimize to only restart if effective config has changed.
-	obs.OnRemove(changed)
-	obs.OnAdd(changed)
+	obs.Lock()
+	defer obs.Unlock()
+
+	for _, e := range changed {
+		env, err := e.Env()
+		if err != nil {
+			obs.params.Logger.Error("unable to convert endpoint to environment map",
+				zap.String("endpoint", string(e.ID)), zap.Error(err))
+			continue
+		}
+
+		newResolved := obs.resolveTemplates(env, e)
+		if resolvedReceiversEqual(obs.receiversByEndpointID.Get(e.ID), newResolved) {
+			obs.params.Logger.Debug("endpoint changed but resolved config is identical, skipping restart",
+				zap.String("endpoint_id", string(e.ID)))
+			continue
+		}
+
+		obs.onRemoveLocked([]observer.Endpoint{e})
+		obs.onAddLocked([]observer.Endpoint{e})
+	}
 }
 
-func (obs *observerHandler) startReceiver(template receiverTemplate, env observer.EndpointEnv, e observer.Endpoint) {
+// resolveTemplates resolves all matching templates for an endpoint without starting any receivers.
+func (obs *observerHandler) resolveTemplates(env observer.EndpointEnv, e observer.Endpoint) []resolvedReceiver {
+	var resolved []resolvedReceiver
+
+	if obs.config.Discovery.Enabled {
+		builder := createK8sHintsBuilder(obs.config.Discovery, obs.params.Logger)
+		subreceiverTemplate, err := builder.createReceiverTemplateFromHints(env)
+		if err != nil {
+			obs.params.Logger.Error("could not extract configurations from K8s hints' annotations", zap.Error(err))
+			return nil
+		}
+		if subreceiverTemplate != nil {
+			if cfg, err := expandConfig(subreceiverTemplate.config, env); err == nil {
+				resolved = append(resolved, resolvedReceiver{resolvedCfg: cfg, endpointTarget: e.Target})
+			}
+			return resolved
+		}
+	}
+
+	for templateKey, template := range obs.config.receiverTemplates {
+		if matches, err := template.rule.eval(env); err != nil {
+			obs.params.Logger.Error("failed matching rule", zap.String("rule", template.Rule), zap.Error(err))
+			continue
+		} else if !matches {
+			continue
+		}
+		if cfg, err := expandConfig(template.config, env); err == nil {
+			resolved = append(resolved, resolvedReceiver{templateKey: templateKey, resolvedCfg: cfg, endpointTarget: e.Target})
+		}
+	}
+
+	return resolved
+}
+
+// resolvedReceiversEqual compares existing receivers against newly resolved states.
+func resolvedReceiversEqual(existing, new []resolvedReceiver) bool {
+	if len(existing) != len(new) {
+		return false
+	}
+	existingByKey := make(map[string]resolvedReceiver, len(existing))
+	for _, r := range existing {
+		existingByKey[r.templateKey] = r
+	}
+	for _, nr := range new {
+		er, ok := existingByKey[nr.templateKey]
+		if !ok {
+			return false
+		}
+		if nr.endpointTarget != er.endpointTarget {
+			return false
+		}
+		if !reflect.DeepEqual(nr.resolvedCfg, er.resolvedCfg) {
+			return false
+		}
+	}
+	return true
+}
+
+func (obs *observerHandler) startReceiver(template receiverTemplate, env observer.EndpointEnv, e observer.Endpoint, templateKey string) {
 	obs.params.Logger.Debug("expanding the following template config",
 		zap.String("name", template.id.String()),
 		zap.String("endpoint", e.Target),
@@ -229,7 +314,12 @@ func (obs *observerHandler) startReceiver(template receiverTemplate, env observe
 		obs.params.Logger.Error("failed to start receiver", zap.String("receiver", template.id.String()), zap.Error(err))
 		return
 	}
-	obs.receiversByEndpointID.Put(e.ID, receiver)
+	obs.receiversByEndpointID.Put(e.ID, resolvedReceiver{
+		component:      receiver,
+		templateKey:    templateKey,
+		resolvedCfg:    resolvedConfig,
+		endpointTarget: e.Target,
+	})
 }
 
 func filterConsumerSignals(consumer *enhancingConsumer, signals receiverSignals) {
